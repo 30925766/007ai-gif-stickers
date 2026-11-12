@@ -1,0 +1,4 @@
+interface:
+  display_name: "007AI GIF 表情包"
+  short_description: "支持 Windows 与 macOS，配置双 Key 后将参考图或文字制作成 GIF 动态表情包"
+  default_prompt: "使用 $007ai-gif-stickers 将我的参考图制作成带指定文字的 GIF 动态表情包。"
