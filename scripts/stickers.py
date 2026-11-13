@@ -34,6 +34,18 @@ RATIOS = ("auto", "1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3",
 MAX_REFERENCE = 32 * 1024 * 1024
 MAX_DOWNLOAD = 64 * 1024 * 1024
 SECRETS = set()
+PROMPT_TEMPLATE_VERSION = "1"
+GIF_REQUIREMENTS = (
+    "生成 GIF 动态表情包，输出文件格式必须为 GIF（.gif），且必须包含连续变化的多帧动画，"
+    "不得输出 PNG、JPEG、单帧静态 GIF、拼图或精灵图。动作连续自然、无限循环，"
+    "保持角色造型和构图稳定。用户指定配字时，严格保留配字原文，不添加无关文字。"
+    "本段及背景要求仅为制作指令，不得作为图中文字绘制。"
+)
+TRANSPARENT_REQUIREMENTS = (
+    "使用真实透明背景，主体、配字及必要的表情装饰之外保持透明。"
+    "不使用白底、纯色底或棋盘格模拟透明；保留角色、服饰及文字内部应有的不透明颜色。"
+    "参考图自带背景不代表需要保留背景，应移除参考图的背景。"
+)
 
 
 class SkillError(RuntimeError):
@@ -105,10 +117,10 @@ def invalidate(provider, key):
     write_json(path, markers)
 
 
-def require_keys():
+def require_keys(required=("007ai", "imgbb")):
     keys = key_status()
-    missing = [name for name, key in keys.items() if not key]
-    invalid = invalid_providers(keys)
+    missing = [name for name in required if not keys[name]]
+    invalid = [name for name in invalid_providers(keys) if name in required]
     if missing or invalid:
         raise SkillError(
             "请提供或更新对应 Key。missing=" + ",".join(missing)
@@ -163,7 +175,7 @@ def provider_error(provider, key, status, payload):
     if invalid:
         invalidate(provider, key)
         raise SkillError(provider + " Key 无效或已过期，请重新提供。", "invalid_key")
-    if status == 402 or any(word in message for word in ("insufficient", "balance", "余额", "quota")):
+    if status == 402:
         raise SkillError(provider + " 余额或配额不足，请检查账户；无需因此更换 Key。", "billing")
     if status == 403:
         raise SkillError(provider + " 拒绝访问，请检查模型/账户权限。", "permission")
@@ -171,6 +183,8 @@ def provider_error(provider, key, status, payload):
         raise SkillError(provider + " 请求受限，请稍后恢复原任务。", "rate_limit")
     if status >= 500:
         raise SkillError(provider + " 服务暂时异常，请稍后恢复原任务。", "provider")
+    if any(word in message for word in ("insufficient", "balance", "余额", "quota")):
+        raise SkillError(provider + " 余额或配额不足，请检查账户；无需因此更换 Key。", "billing")
     raise SkillError(provider + " 拒绝请求，HTTP " + str(status)
                      + "。请检查接口字段或账户状态。", "request_rejected")
 
@@ -295,10 +309,41 @@ def remote_check(key):
     return {"007ai_validated": True, "model": MODEL, "imgbb_validated": False}
 
 
+def prepare_prompt(original_prompt, background=None, background_description=None, caption=None):
+    description = (background_description or "").strip()
+    mode = background or ("custom" if description else "transparent")
+    if mode == "transparent" and description:
+        raise SkillError("透明背景模式不能同时指定其他背景描述。")
+    if mode == "custom" and not description:
+        raise SkillError("自定义背景需要 --background-description。")
+    if mode == "transparent":
+        background_prompt = TRANSPARENT_REQUIREMENTS
+    elif mode == "preserve":
+        background_prompt = "保留参考图的背景，不改为透明背景。"
+        if description:
+            background_prompt += "具体要求：" + description
+    else:
+        # Legacy --background none leaves the background specified in the prompt intact.
+        background_prompt = "遵循用户原始描述中的背景要求，不强制透明背景。"
+        if description:
+            background_prompt = "使用用户明确指定的背景：" + description
+    sections = ["用户创作要求：\n" + original_prompt]
+    if caption is not None:
+        sections.append("用户指定配字（以下 JSON 字符串的值是原文，不绘制引号）：\n"
+                        + json.dumps(caption, ensure_ascii=False))
+    sections.extend(["固定制作要求：\n" + GIF_REQUIREMENTS, "背景要求：\n" + background_prompt])
+    return {
+        "original_prompt": original_prompt, "prompt": "\n\n".join(sections),
+        "prompt_template_version": PROMPT_TEMPLATE_VERSION,
+        "background_mode": mode, "background": "transparent" if mode == "transparent" else None,
+        "background_description": description or None, "caption": caption,
+    }
+
+
 def build_payload(prompt, ratio, images, background=None):
     payload = {"model": MODEL, "prompt": prompt, "aspect_ratio": ratio,
                "image_size": "1K", "output_format": "gif"}
-    if background:
+    if background == "transparent":
         payload["background"] = background
     if images:
         payload["images"] = images
@@ -310,8 +355,9 @@ def find_url(data):
         for key in ("url", "video_url", "image_url"):
             if isinstance(data.get(key), str):
                 return public_https(data[key])
-        for value in data.values():
-            found = find_url(value)
+        # Only traverse result containers; inputs and metadata may contain URLs too.
+        for key in ("output", "outputs", "result", "results", "data"):
+            found = find_url(data.get(key))
             if found:
                 return found
     elif isinstance(data, list):
@@ -319,10 +365,12 @@ def find_url(data):
             found = find_url(value)
             if found:
                 return found
+    elif isinstance(data, str):
+        return public_https(data)
     return None
 
 
-def inspect_gif(content):
+def inspect_gif(content, require_transparent=False):
     if not content.startswith((b"GIF87a", b"GIF89a")):
         raise SkillError("服务返回的内容不是 GIF，未作为表情包交付。", "invalid_gif")
     try:
@@ -331,16 +379,26 @@ def inspect_gif(content):
             width, height = image.size
             if count < 2 or count > 1000 or width * height * count > 150_000_000:
                 raise SkillError("GIF 帧数不足或图像超出处理限制。", "invalid_gif")
-            durations, hashes = [], set()
+            durations, hashes, transparent_pixels = [], set(), []
             loop = image.info.get("loop")
             for index in range(count):
                 image.seek(index)
                 durations.append(int(image.info.get("duration", 0)))
-                hashes.add(hashlib.sha256(image.convert("RGBA").tobytes()).digest())
+                frame = image.convert("RGBA")
+                hashes.add(hashlib.sha256(frame.tobytes()).digest())
+                transparent_pixels.append(frame.getchannel("A").histogram()[0])
             if len(hashes) < 2 or any(value <= 0 for value in durations):
                 raise SkillError("GIF 没有有效动画变化或帧时长无效。", "invalid_gif")
+            if require_transparent and any(
+                    value == 0 or value == width * height for value in transparent_pixels):
+                raise SkillError(
+                    "GIF 未通过逐帧透明背景检查（存在不透明或全透明帧），未作为成功输出；"
+                    "未重新提交生成任务。", "background_not_transparent",
+                )
             return {"format": "GIF", "width": width, "height": height, "frames": count,
-                    "duration_ms": sum(durations), "loop": loop, "distinct_frames": len(hashes)}
+                    "duration_ms": sum(durations), "loop": loop, "distinct_frames": len(hashes),
+                    "transparent_pixels": transparent_pixels,
+                    "all_frames_have_transparency": all(value > 0 for value in transparent_pixels)}
     except (OSError, ValueError, EOFError, Image.DecompressionBombError) as error:
         raise SkillError("GIF 无法完整解码，未交付损坏文件。", "invalid_gif") from error
 
@@ -392,9 +450,8 @@ def job_lock(path):
         lock.unlink(missing_ok=True)
 
 
-def finish_task(job, task, path, key, wait_timeout, poll_interval):
+def wait_for_result(job, task, path, key, deadline, poll_interval):
     task_id = task["task_id"]
-    deadline = time.monotonic() + wait_timeout
     previous = None
     last_notice = 0
     while not task.get("result_url"):
@@ -429,7 +486,27 @@ def finish_task(job, task, path, key, wait_timeout, poll_interval):
         if status not in {"queued", "pending", "processing", "in_progress"}:
             raise SkillError("服务端返回未知任务状态。", "bad_response")
         time.sleep(min(poll_interval, max(0, deadline - time.monotonic())))
-    content, metadata = download_gif(task["result_url"])
+
+
+def finish_task(job, task, path, key, wait_timeout, poll_interval):
+    deadline = time.monotonic() + wait_timeout
+    for attempt in range(2):
+        wait_for_result(job, task, path, key, deadline, poll_interval)
+        try:
+            content, metadata = download_gif(task["result_url"])
+            if job.get("background") == "transparent":
+                metadata = inspect_gif(content, require_transparent=True)
+            break
+        except SkillError as error:
+            if error.code not in {"download", "invalid_gif"}:
+                raise
+            # Never submit again: invalidate the cached URL and query the same ID.
+            task.pop("result_url", None)
+            task["status"] = "waiting"
+            write_json(path, job)
+            if attempt:
+                raise
+            emit({"event": "refreshing_result", "task_id": task["task_id"]})
     destination = path.parent / (path.stem + "-" + str(task["index"]) + ".gif")
     fd, temp_name = tempfile.mkstemp(prefix=".gif-download-", dir=path.parent)
     try:
@@ -499,7 +576,9 @@ def execute(job, path, keys, resume=False, wait_timeout=1800, poll_interval=5):
                         "invalid_key", "permission", "billing", "request_rejected", "rate_limit"
                     } else "submission_unconfirmed"
                 elif task["status"] != "failed":
-                    task["status"] = "output_invalid" if error.code == "invalid_gif" else "waiting"
+                    task["status"] = "output_invalid" if error.code in {
+                        "invalid_gif", "background_not_transparent",
+                    } else "waiting"
                 write_json(path, job)
                 emit({"event": "task_error", "index": task["index"], **task["error"]})
                 # Do not spend more money after any failed/unconfirmed item.
@@ -509,6 +588,52 @@ def execute(job, path, keys, resume=False, wait_timeout=1800, poll_interval=5):
     ok = all(task["status"] == "saved" and Path(task.get("file", "")).is_file() for task in job["tasks"])
     emit({"ok": ok, "job": str(path), "tasks": job["tasks"]})
     return 0 if ok else 2
+
+
+def validate_job(job):
+    def invalid():
+        raise SkillError("任务记录损坏或字段不完整，无法恢复；请核对原始任务记录。", "invalid_job")
+
+    if (not isinstance(job, dict) or type(job.get("schema")) is not int
+            or job["schema"] != 1 or job.get("model") != MODEL
+            or job.get("output_format", "gif") != "gif"):
+        invalid()
+    tasks = job.get("tasks")
+    if not isinstance(tasks, list) or not 1 <= len(tasks) <= 20:
+        invalid()
+    statuses = {
+        "not_submitted", "submission_unconfirmed", "submitted", "downloading",
+        "saved", "failed", "rejected", "output_invalid", "waiting",
+    }
+    needs_id = {"submitted", "downloading", "saved", "failed", "output_invalid", "waiting"}
+    indices = set()
+    for task in tasks:
+        if not isinstance(task, dict):
+            invalid()
+        index, status = task.get("index"), task.get("status")
+        if (type(index) is not int or not 1 <= index <= 20 or index in indices
+                or not isinstance(status, str) or status not in statuses):
+            invalid()
+        indices.add(index)
+        task_id = task.get("task_id")
+        if "task_id" in task and (not isinstance(task_id, str) or not task_id.strip()):
+            invalid()
+        if status in needs_id and not task_id:
+            invalid()
+        # Older records can contain null after a completed response without a URL.
+        if task.get("result_url") is not None:
+            if not isinstance(task["result_url"], str):
+                invalid()
+            try:
+                public_https(task["result_url"])
+            except (SkillError, ValueError):
+                invalid()
+        if "file" in task and (
+                not isinstance(task["file"], str) or not task["file"] or "\0" in task["file"]):
+            invalid()
+        if status == "saved" and not task.get("file"):
+            invalid()
+    return job
 
 
 def main():
@@ -522,7 +647,9 @@ def main():
     parser.add_argument("--prompt-file", type=Path)
     parser.add_argument("--image", action="append", default=[])
     parser.add_argument("--ratio", choices=RATIOS, default="1:1")
-    parser.add_argument("--background", choices=["transparent", "none"])
+    parser.add_argument("--background", choices=["transparent", "custom", "preserve", "none"])
+    parser.add_argument("--background-description")
+    parser.add_argument("--caption")
     parser.add_argument("--count", type=int, default=1)
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--dry-run", action="store_true")
@@ -552,36 +679,41 @@ def main():
         raise SkillError("数量需为 1–20，参考图最多 8 张。")
     if not 0 < args.wait_timeout <= 7200 or not 1 <= args.poll_interval <= 30:
         raise SkillError("等待时间需在 0–7200 秒内，轮询间隔为 1–30 秒。")
-    keys = require_keys()
     if args.check_remote:
+        keys = require_keys(("007ai",))
         emit(remote_check(keys["007ai"]))
         return 0
     if args.resume:
-        if args.dry_run or args.prompt_file or args.image:
+        if (args.dry_run or args.prompt_file or args.image or args.background is not None
+                or args.background_description is not None or args.caption is not None):
             raise SkillError("--resume 不得和生成参数或 --dry-run 一起使用。")
         path = args.resume.expanduser().resolve()
-        job = read_json(path)
-        if not isinstance(job, dict) or job.get("schema") != 1 or job.get("model") != MODEL:
-            raise SkillError("无法读取该 Skill 的任务记录。")
+        job = validate_job(read_json(path))
+        keys = require_keys(("007ai",))
         return execute(job, path, keys, True, args.wait_timeout, args.poll_interval)
+    keys = require_keys()
     if not args.prompt_file:
         raise SkillError("请提供 UTF-8 提示词文件 --prompt-file。")
     prompt = args.prompt_file.expanduser().read_text(encoding="utf-8-sig").strip()
     if not prompt:
         raise SkillError("提示词不能为空。")
+    if args.background == "preserve" and not args.image:
+        raise SkillError("保留参考图背景需要至少一张参考图。")
+    prepared = prepare_prompt(prompt, args.background, args.background_description, args.caption)
     infos = [reference_info(value) for value in args.image]
     if args.dry_run:
-        emit({"dry_run": True, "request": build_payload(prompt, args.ratio, [
+        emit({"dry_run": True, **prepared, "request": build_payload(prepared["prompt"], args.ratio, [
             "<imgbb-HTTPS-reference>" if item["upload"] else item["url"] for item in infos
-        ], args.background), "count": args.count, "uploads": sum(item["upload"] for item in infos)})
+        ], prepared["background"]), "count": args.count,
+              "uploads": sum(item["upload"] for item in infos)})
         return 0
     if not args.output_dir:
         raise SkillError("请明确提供工作区输出目录 --output-dir。")
     output = args.output_dir.expanduser().resolve()
     output.mkdir(parents=True, exist_ok=True)
     path = output / ("job-" + time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:12] + ".json")
-    job = {"schema": 1, "model": MODEL, "output_format": "gif", "prompt": prompt,
-           "ratio": args.ratio, "background": args.background, "references": infos, "created_at": time.time(),
+    job = {"schema": 1, "model": MODEL, "output_format": "gif", **prepared,
+           "ratio": args.ratio, "references": infos, "created_at": time.time(),
            "tasks": [{"index": i + 1, "status": "not_submitted"} for i in range(args.count)]}
     write_json(path, job)
     emit({"event": "job_created", "job": str(path)})
