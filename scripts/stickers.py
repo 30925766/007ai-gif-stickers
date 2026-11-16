@@ -34,11 +34,12 @@ RATIOS = ("auto", "1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3",
 MAX_REFERENCE = 32 * 1024 * 1024
 MAX_DOWNLOAD = 64 * 1024 * 1024
 SECRETS = set()
-PROMPT_TEMPLATE_VERSION = "2"
+PROMPT_TEMPLATE_VERSION = "3"
 GIF_REQUIREMENTS = (
     "生成 GIF 动态表情包，输出文件格式必须为 GIF（.gif），且必须包含连续变化的多帧动画，"
     "不得输出 PNG、JPEG、单帧静态 GIF、拼图或精灵图。动作连续自然、无限循环，"
-    "保持角色造型和构图稳定。用户指定配字时，严格保留配字原文，不添加无关文字。"
+    "保持角色造型和构图稳定。每张表情包必须带清晰可读的文字配字，不得只有动作或表情而没有配字。"
+    "严格使用用户指定配字段落中的原文，不添加无关文字，配字不得被遮挡或裁切。"
     "本段及背景要求仅为制作指令，不得作为图中文字绘制。"
 )
 
@@ -305,6 +306,9 @@ def remote_check(key):
 
 
 def prepare_prompt(original_prompt, background=None, background_description=None, caption=None):
+    if not isinstance(caption, str) or not caption.strip():
+        raise SkillError("每张表情包必须有配字；请根据用户原文或表情动作拟定文字并传入 --caption。",
+                         "caption_required")
     description = (background_description or "").strip()
     mode = background or ("custom" if description else "transparent")
     if mode == "transparent" and description:
@@ -527,7 +531,6 @@ def reveal_file(file):
 
 
 def execute(job, path, keys, resume=False, wait_timeout=1800, poll_interval=5):
-    saved_files = []
     with job_lock(path):
         if not resume:
             # Resolve all references before any chargeable task is submitted.
@@ -554,7 +557,7 @@ def execute(job, path, keys, resume=False, wait_timeout=1800, poll_interval=5):
                     write_json(path, job)
                     emit({"event": "submitted", "task_id": task_id, "job": str(path)})
                 finish_task(job, task, path, keys["007ai"], wait_timeout, poll_interval)
-                saved_files.append(task["file"])
+                reveal_file(task["file"])
             except SkillError as error:
                 task["error"] = {"code": error.code, "message": safe_message(error)}
                 if not task.get("task_id"):
@@ -567,8 +570,6 @@ def execute(job, path, keys, resume=False, wait_timeout=1800, poll_interval=5):
                 emit({"event": "task_error", "index": task["index"], **task["error"]})
                 # Do not spend more money after any failed/unconfirmed item.
                 break
-    if saved_files:
-        reveal_file(saved_files[0])
     ok = all(task["status"] == "saved" and Path(task.get("file", "")).is_file() for task in job["tasks"])
     emit({"ok": ok, "job": str(path), "tasks": job["tasks"]})
     return 0 if ok else 2

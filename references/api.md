@@ -26,11 +26,16 @@ Every new job appends the versioned GIF animation instructions to the original
 prompt once. The job stores original_prompt, prompt (the exact submitted text),
 prompt_template_version, background_mode, background_description and caption.
 Dry runs use the same preparation path; resume never rebuilds prompts.
+Prompt template version 3 requires a nonempty --caption for every new generation.
+The assistant preserves user-specified wording or chooses a short caption from
+the expression/action when omitted. No paid request is made without a caption.
+Each successfully saved GIF is immediately revealed in Explorer/Finder,
+including individual items within a batch and downloads of resumed tasks.
 The calling assistant interprets background intent and passes structured options:
 transparent (default), custom with --background-description, or preserve.
 Only transparent mode sends background=transparent; other modes express their
 background in the prompt and omit the API background field.
-Prompt template version 2 does not append a background section or built-in
+Prompt template versions 2 and later do not append a background section or built-in
 transparency wording in transparent mode. Transparency is set by the API field;
 the original user description and caption remain intact.
 The legacy CLI background=none option never sends a literal "none" API value.

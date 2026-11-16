@@ -307,7 +307,7 @@ class StickerTests(unittest.TestCase):
             return stickers.main()
 
     def test_default_prompt_requires_gif_and_transparency(self):
-        prepared = stickers.prepare_prompt("红色衣服，白色配字，挥手。")
+        prepared = stickers.prepare_prompt("红色衣服，白色配字，挥手。", caption="嗨")
         payload = stickers.build_payload(prepared["prompt"], "1:1", [], prepared["background"])
         self.assertEqual(prepared["background_mode"], "transparent")
         self.assertEqual(payload["background"], "transparent")
@@ -315,7 +315,7 @@ class StickerTests(unittest.TestCase):
         self.assertIn(stickers.GIF_REQUIREMENTS, payload["prompt"])
         self.assertNotIn("背景要求：", payload["prompt"])
         self.assertNotIn("透明", payload["prompt"])
-        self.assertEqual(prepared["prompt_template_version"], "2")
+        self.assertEqual(prepared["prompt_template_version"], "3")
         self.assertEqual(prepared["original_prompt"], "红色衣服，白色配字，挥手。")
 
     def test_custom_and_preserved_backgrounds_do_not_receive_transparency(self):
@@ -325,7 +325,7 @@ class StickerTests(unittest.TestCase):
             (None, "粉色背景"), ("none", None),
         ):
             with self.subTest(mode=mode, description=description):
-                prepared = stickers.prepare_prompt("挥手", mode, description)
+                prepared = stickers.prepare_prompt("挥手", mode, description, caption="嗨")
                 payload = stickers.build_payload(
                     prepared["prompt"], "1:1", ["https://example.com/ref.png"], prepared["background"],
                 )
@@ -337,7 +337,7 @@ class StickerTests(unittest.TestCase):
     def test_conflicting_or_incomplete_background_options_are_rejected(self):
         for mode, description in (("transparent", "白色背景"), ("custom", None), ("custom", " ")):
             with self.subTest(mode=mode), self.assertRaises(stickers.SkillError):
-                stickers.prepare_prompt("挥手", mode, description)
+                stickers.prepare_prompt("挥手", mode, description, caption="嗨")
         with self.assertRaises(stickers.SkillError):
             self.generate_with_options(["--background", "preserve"])
 
@@ -349,6 +349,60 @@ class StickerTests(unittest.TestCase):
         self.assertEqual(prepared["prompt"].count(stickers.GIF_REQUIREMENTS), 1)
         self.assertNotIn("背景要求：", prepared["prompt"])
 
+    def test_missing_and_blank_captions_stop_before_network_or_job_creation(self):
+        for caption in (None, "", " \n\t"):
+            with self.subTest(caption=caption), patch.object(stickers, "request_json") as request:
+                options = [] if caption is None else ["--caption", caption]
+                with self.assertRaises(stickers.SkillError) as error:
+                    self.generate_with_options(options, dry_run=False)
+                self.assertEqual(error.exception.code, "caption_required")
+                request.assert_not_called()
+                self.assertFalse((self.root / "output").exists())
+
+    def test_batch_reveals_each_file_before_processing_next_item(self):
+        self.job["tasks"] = [
+            {"index": index, "task_id": "task-" + str(index), "status": "waiting"}
+            for index in range(1, 4)
+        ]
+        events = []
+
+        def finish(job, task, path, *args):
+            events.append(("finish", task["index"]))
+            destination = self.root / (str(task["index"]) + ".gif")
+            destination.write_bytes(self.gif)
+            task.update(status="saved", file=str(destination))
+
+        def reveal(file):
+            events.append(("reveal", int(Path(file).stem)))
+
+        with patch.object(stickers, "finish_task", side_effect=finish), patch.object(
+                stickers, "reveal_file", side_effect=reveal), patch.object(
+                stickers, "request_json") as request:
+            self.assertEqual(self.resume(), 0)
+            self.assertEqual(events, [
+                ("finish", 1), ("reveal", 1), ("finish", 2), ("reveal", 2),
+                ("finish", 3), ("reveal", 3),
+            ])
+            events.clear()
+            self.assertEqual(self.resume(), 0)
+            self.assertEqual(events, [])
+            request.assert_not_called()
+
+    def test_successful_file_is_revealed_even_when_next_task_fails(self):
+        self.job["tasks"].append({"index": 2, "task_id": "second-id", "status": "waiting"})
+
+        def finish(job, task, path, *args):
+            if task["index"] == 2:
+                raise stickers.SkillError("download failed", "download")
+            destination = self.root / "saved.gif"
+            destination.write_bytes(self.gif)
+            task.update(status="saved", file=str(destination))
+
+        with patch.object(stickers, "finish_task", side_effect=finish), patch.object(
+                stickers, "reveal_file") as reveal:
+            self.assertEqual(self.resume(), 2)
+            reveal.assert_called_once_with(str(self.root / "saved.gif"))
+
     def test_explicit_transparent_mode_uses_parameter_without_background_text(self):
         prepared = stickers.prepare_prompt("开心挥手", background="transparent", caption="嗨")
         payload = stickers.build_payload(prepared["prompt"], "1:1", [], prepared["background"])
@@ -359,7 +413,7 @@ class StickerTests(unittest.TestCase):
 
     def test_user_transparency_description_is_preserved_verbatim(self):
         original = "挥手，透明背景"
-        prepared = stickers.prepare_prompt(original)
+        prepared = stickers.prepare_prompt(original, caption="嗨")
         self.assertEqual(prepared["original_prompt"], original)
         self.assertIn(original, prepared["prompt"])
         self.assertNotIn("背景要求：", prepared["prompt"])

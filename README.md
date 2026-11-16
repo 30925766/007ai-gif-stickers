@@ -1,11 +1,11 @@
-# 007AI GIF Stickers V1.1.1
+# 007AI GIF Stickers V1.1.2
 
 通过 007AI 与 imgBB，把参考图或文字制作成 GIF 动态聊天表情包。
 固定使用 `gptimage2.6_gr`、`image_size=1K`、`output_format=gif`，默认生成一个 1:1 GIF。
 
 ## 安装
 
-从本仓库 V1.1.1 Release 下载 `007ai-gif-stickers-V1.1.1.zip`，
+从本仓库 V1.1.2 Release 下载 `007ai-gif-stickers-V1.1.2.zip`，
 将其中的 `007ai-gif-stickers` 文件夹放入软件的技能目录。
 Codex 默认目录为 `~/.codex/skills/`。首次调用时才初始化独立 Python 环境。
 
@@ -15,6 +15,8 @@ Codex 默认目录为 `~/.codex/skills/`。首次调用时才初始化独立 Pyt
 ## GIF 动画与背景
 
 每次新生成自动加入多帧 GIF 动画、连续动作和无限循环的内置要求。
+每张表情包必须带配字；未指定时由助手根据表情和动作自动拟定。
+每张 GIF 成功保存后立即自动打开文件位置，批量及恢复下载也逐张执行。
 用户没有指定背景时默认透明；明确指定颜色、场景或保留参考图背景时遵循用户要求。
 服装、文字的颜色不属于背景要求，参考图自带背景也不代表需要保留。
 
@@ -55,11 +57,11 @@ bash scripts/run.sh --check
 
 ```bash
 python -m unittest discover -s tests -v
-python scripts/package_skill.py --output /path/outside/skill/007ai-gif-stickers-V1.1.1.zip
+python scripts/package_skill.py --output /path/outside/skill/007ai-gif-stickers-V1.1.2.zip
 ```
 
 离线回归测试覆盖 GIF 验收、提示词合并、背景参数及任务恢复。
 打包采用固定文件白名单，不含 Key、虚拟环境、缓存、日志、任务记录、生成图片或开发测试。
 离线测试不会上传参考图或提交收费任务。
 
-版本号见 [VERSION](VERSION)；Git 标签与 Release 名称均为 `V1.1.1`。
+版本号见 [VERSION](VERSION)；Git 标签与 Release 名称均为 `V1.1.2`。
