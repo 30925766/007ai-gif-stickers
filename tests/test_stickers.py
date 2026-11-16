@@ -313,7 +313,9 @@ class StickerTests(unittest.TestCase):
         self.assertEqual(payload["background"], "transparent")
         self.assertEqual(payload["output_format"], "gif")
         self.assertIn(stickers.GIF_REQUIREMENTS, payload["prompt"])
-        self.assertIn(stickers.TRANSPARENT_REQUIREMENTS, payload["prompt"])
+        self.assertNotIn("背景要求：", payload["prompt"])
+        self.assertNotIn("透明", payload["prompt"])
+        self.assertEqual(prepared["prompt_template_version"], "2")
         self.assertEqual(prepared["original_prompt"], "红色衣服，白色配字，挥手。")
 
     def test_custom_and_preserved_backgrounds_do_not_receive_transparency(self):
@@ -329,7 +331,6 @@ class StickerTests(unittest.TestCase):
                 )
                 self.assertNotIn("background", payload)
                 self.assertIn(stickers.GIF_REQUIREMENTS, payload["prompt"])
-                self.assertNotIn(stickers.TRANSPARENT_REQUIREMENTS, payload["prompt"])
                 if description:
                     self.assertIn(description, payload["prompt"])
 
@@ -346,7 +347,22 @@ class StickerTests(unittest.TestCase):
         self.assertEqual(prepared["caption"], caption)
         self.assertIn(json.dumps(caption, ensure_ascii=False), prepared["prompt"])
         self.assertEqual(prepared["prompt"].count(stickers.GIF_REQUIREMENTS), 1)
-        self.assertEqual(prepared["prompt"].count(stickers.TRANSPARENT_REQUIREMENTS), 1)
+        self.assertNotIn("背景要求：", prepared["prompt"])
+
+    def test_explicit_transparent_mode_uses_parameter_without_background_text(self):
+        prepared = stickers.prepare_prompt("开心挥手", background="transparent", caption="嗨")
+        payload = stickers.build_payload(prepared["prompt"], "1:1", [], prepared["background"])
+        self.assertEqual(payload["background"], "transparent")
+        self.assertEqual(payload["output_format"], "gif")
+        self.assertNotIn("透明", payload["prompt"])
+        self.assertNotIn("背景要求：", payload["prompt"])
+
+    def test_user_transparency_description_is_preserved_verbatim(self):
+        original = "挥手，透明背景"
+        prepared = stickers.prepare_prompt(original)
+        self.assertEqual(prepared["original_prompt"], original)
+        self.assertIn(original, prepared["prompt"])
+        self.assertNotIn("背景要求：", prepared["prompt"])
 
     def test_dry_run_and_submission_use_identical_prepared_payload(self):
         for options in (["--caption", "嗨！"], [
@@ -388,29 +404,26 @@ class StickerTests(unittest.TestCase):
                        duration=100, loop=0, disposal=2, optimize=False)
         return output.getvalue()
 
-    def test_transparency_checks_every_composited_frame(self):
-        content = self.transparent_gif()
-        metadata = stickers.inspect_gif(content, require_transparent=True)
-        self.assertEqual(len(metadata["transparent_pixels"]), 2)
-        self.assertTrue(metadata["all_frames_have_transparency"])
-        self.assertTrue(all(0 < value < 256 for value in metadata["transparent_pixels"]))
-        for content in (self.gif, self.transparent_gif(second_frame_opaque=True)):
-            with self.subTest(content_size=len(content)), self.assertRaises(stickers.SkillError) as error:
-                stickers.inspect_gif(content, require_transparent=True)
-            self.assertEqual(error.exception.code, "background_not_transparent")
+    def test_gif_validation_accepts_different_backgrounds(self):
+        for content in (self.gif, self.transparent_gif(),
+                        self.transparent_gif(second_frame_opaque=True)):
+            with self.subTest(content_size=len(content)):
+                metadata = stickers.inspect_gif(content)
+                self.assertEqual(metadata["format"], "GIF")
+                self.assertEqual(metadata["frames"], 2)
 
-    def test_opaque_output_in_transparent_mode_is_not_saved_or_regenerated(self):
+    def test_opaque_output_in_transparent_mode_is_saved_without_regeneration(self):
         self.job["background"] = "transparent"
         self.job["tasks"][0]["result_url"] = "https://example.com/opaque.gif"
         with patch.object(stickers, "request_json") as request, patch.object(
                 stickers, "download_gif", return_value=self.download) as download:
-            self.assertEqual(self.resume(), 2)
+            self.assertEqual(self.resume(), 0)
         request.assert_not_called()
         self.assertEqual(download.call_count, 1)
-        self.assertFalse(list(self.root.glob("*.gif")))
         task = stickers.read_json(self.path)["tasks"][0]
-        self.assertEqual(task["status"], "output_invalid")
-        self.assertEqual(task["error"]["code"], "background_not_transparent")
+        self.assertEqual(task["status"], "saved")
+        self.assertIsNone(task["error"])
+        self.assertEqual(Path(task["file"]).read_bytes(), self.gif)
         self.assertEqual(task["task_id"], "original-id")
 
     def test_valid_transparent_output_is_saved(self):
@@ -421,7 +434,7 @@ class StickerTests(unittest.TestCase):
                 content, stickers.inspect_gif(content))):
             self.assertEqual(self.resume(), 0)
         task = stickers.read_json(self.path)["tasks"][0]
-        self.assertTrue(task["gif"]["all_frames_have_transparency"])
+        self.assertEqual(task["gif"]["format"], "GIF")
         self.assertEqual(Path(task["file"]).read_bytes(), content)
 
     def test_non_gif_and_static_images_are_rejected(self):

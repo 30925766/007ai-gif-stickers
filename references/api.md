@@ -30,9 +30,12 @@ The calling assistant interprets background intent and passes structured options
 transparent (default), custom with --background-description, or preserve.
 Only transparent mode sends background=transparent; other modes express their
 background in the prompt and omit the API background field.
+Prompt template version 2 does not append a background section or built-in
+transparency wording in transparent mode. Transparency is set by the API field;
+the original user description and caption remain intact.
 The legacy CLI background=none option never sends a literal "none" API value.
-Transparent outputs must have both transparent and visible pixels in every
-decoded frame. Failure is reported without submitting another generation.
+Output validation checks GIF format, animation and decoding, not transparency.
+A valid animated GIF is accepted regardless of its actual background.
 Ratios: auto, 1:1, 16:9, 9:16, 4:3, 3:4, 3:2, 2:3, 5:4, 4:5, 21:9,
 9:21, 1:3, 3:1, 2:1, 1:2.
 

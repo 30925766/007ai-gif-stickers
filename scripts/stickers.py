@@ -34,17 +34,12 @@ RATIOS = ("auto", "1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3",
 MAX_REFERENCE = 32 * 1024 * 1024
 MAX_DOWNLOAD = 64 * 1024 * 1024
 SECRETS = set()
-PROMPT_TEMPLATE_VERSION = "1"
+PROMPT_TEMPLATE_VERSION = "2"
 GIF_REQUIREMENTS = (
     "生成 GIF 动态表情包，输出文件格式必须为 GIF（.gif），且必须包含连续变化的多帧动画，"
     "不得输出 PNG、JPEG、单帧静态 GIF、拼图或精灵图。动作连续自然、无限循环，"
     "保持角色造型和构图稳定。用户指定配字时，严格保留配字原文，不添加无关文字。"
     "本段及背景要求仅为制作指令，不得作为图中文字绘制。"
-)
-TRANSPARENT_REQUIREMENTS = (
-    "使用真实透明背景，主体、配字及必要的表情装饰之外保持透明。"
-    "不使用白底、纯色底或棋盘格模拟透明；保留角色、服饰及文字内部应有的不透明颜色。"
-    "参考图自带背景不代表需要保留背景，应移除参考图的背景。"
 )
 
 
@@ -317,7 +312,7 @@ def prepare_prompt(original_prompt, background=None, background_description=None
     if mode == "custom" and not description:
         raise SkillError("自定义背景需要 --background-description。")
     if mode == "transparent":
-        background_prompt = TRANSPARENT_REQUIREMENTS
+        background_prompt = None
     elif mode == "preserve":
         background_prompt = "保留参考图的背景，不改为透明背景。"
         if description:
@@ -331,7 +326,9 @@ def prepare_prompt(original_prompt, background=None, background_description=None
     if caption is not None:
         sections.append("用户指定配字（以下 JSON 字符串的值是原文，不绘制引号）：\n"
                         + json.dumps(caption, ensure_ascii=False))
-    sections.extend(["固定制作要求：\n" + GIF_REQUIREMENTS, "背景要求：\n" + background_prompt])
+    sections.append("固定制作要求：\n" + GIF_REQUIREMENTS)
+    if background_prompt:
+        sections.append("背景要求：\n" + background_prompt)
     return {
         "original_prompt": original_prompt, "prompt": "\n\n".join(sections),
         "prompt_template_version": PROMPT_TEMPLATE_VERSION,
@@ -370,7 +367,7 @@ def find_url(data):
     return None
 
 
-def inspect_gif(content, require_transparent=False):
+def inspect_gif(content):
     if not content.startswith((b"GIF87a", b"GIF89a")):
         raise SkillError("服务返回的内容不是 GIF，未作为表情包交付。", "invalid_gif")
     try:
@@ -379,26 +376,17 @@ def inspect_gif(content, require_transparent=False):
             width, height = image.size
             if count < 2 or count > 1000 or width * height * count > 150_000_000:
                 raise SkillError("GIF 帧数不足或图像超出处理限制。", "invalid_gif")
-            durations, hashes, transparent_pixels = [], set(), []
+            durations, hashes = [], set()
             loop = image.info.get("loop")
             for index in range(count):
                 image.seek(index)
                 durations.append(int(image.info.get("duration", 0)))
                 frame = image.convert("RGBA")
                 hashes.add(hashlib.sha256(frame.tobytes()).digest())
-                transparent_pixels.append(frame.getchannel("A").histogram()[0])
             if len(hashes) < 2 or any(value <= 0 for value in durations):
                 raise SkillError("GIF 没有有效动画变化或帧时长无效。", "invalid_gif")
-            if require_transparent and any(
-                    value == 0 or value == width * height for value in transparent_pixels):
-                raise SkillError(
-                    "GIF 未通过逐帧透明背景检查（存在不透明或全透明帧），未作为成功输出；"
-                    "未重新提交生成任务。", "background_not_transparent",
-                )
             return {"format": "GIF", "width": width, "height": height, "frames": count,
-                    "duration_ms": sum(durations), "loop": loop, "distinct_frames": len(hashes),
-                    "transparent_pixels": transparent_pixels,
-                    "all_frames_have_transparency": all(value > 0 for value in transparent_pixels)}
+                    "duration_ms": sum(durations), "loop": loop, "distinct_frames": len(hashes)}
     except (OSError, ValueError, EOFError, Image.DecompressionBombError) as error:
         raise SkillError("GIF 无法完整解码，未交付损坏文件。", "invalid_gif") from error
 
@@ -494,8 +482,6 @@ def finish_task(job, task, path, key, wait_timeout, poll_interval):
         wait_for_result(job, task, path, key, deadline, poll_interval)
         try:
             content, metadata = download_gif(task["result_url"])
-            if job.get("background") == "transparent":
-                metadata = inspect_gif(content, require_transparent=True)
             break
         except SkillError as error:
             if error.code not in {"download", "invalid_gif"}:
@@ -576,9 +562,7 @@ def execute(job, path, keys, resume=False, wait_timeout=1800, poll_interval=5):
                         "invalid_key", "permission", "billing", "request_rejected", "rate_limit"
                     } else "submission_unconfirmed"
                 elif task["status"] != "failed":
-                    task["status"] = "output_invalid" if error.code in {
-                        "invalid_gif", "background_not_transparent",
-                    } else "waiting"
+                    task["status"] = "output_invalid" if error.code == "invalid_gif" else "waiting"
                 write_json(path, job)
                 emit({"event": "task_error", "index": task["index"], **task["error"]})
                 # Do not spend more money after any failed/unconfirmed item.
