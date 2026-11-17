@@ -34,7 +34,7 @@ RATIOS = ("auto", "1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3",
 MAX_REFERENCE = 32 * 1024 * 1024
 MAX_DOWNLOAD = 64 * 1024 * 1024
 SECRETS = set()
-PROMPT_TEMPLATE_VERSION = "3"
+PROMPT_TEMPLATE_VERSION = "4"
 GIF_REQUIREMENTS = (
     "生成 GIF 动态表情包，输出文件格式必须为 GIF（.gif），且必须包含连续变化的多帧动画，"
     "不得输出 PNG、JPEG、单帧静态 GIF、拼图或精灵图。动作连续自然、无限循环，"
@@ -532,13 +532,33 @@ def reveal_file(file):
 
 def execute(job, path, keys, resume=False, wait_timeout=1800, poll_interval=5):
     with job_lock(path):
+        if "plan_status" in job:
+            # Reload under the lock so concurrent confirmations cannot erase task IDs.
+            job = validate_job(read_json(path))
+            if resume and job["plan_status"] == "awaiting_confirmation":
+                raise SkillError("该规划尚未确认。", "plan_confirmation_required")
+            if not resume and job["plan_status"] == "awaiting_confirmation":
+                job["plan_status"] = "confirmed"
+                job["confirmed_at"] = time.time()
+                write_json(path, job)
         if not resume:
             # Resolve all references before any chargeable task is submitted.
-            images = [prepare_reference(info, keys["imgbb"]) for info in job.pop("references")]
-            job["images"] = images
-            write_json(path, job)
+            references = job.pop("references", None)
+            if references is not None:
+                job["images"] = [
+                    prepare_reference(info, keys["imgbb"]) for info in references
+                ]
+                write_json(path, job)
+            elif not isinstance(job.get("images"), list):
+                raise SkillError("规划缺少参考图状态，无法安全启动或恢复。", "invalid_job")
         for task in job["tasks"]:
             if task["status"] == "saved" and Path(task.get("file", "")).is_file():
+                continue
+            if task["status"] == "submission_unconfirmed" and not task.get("task_id"):
+                continue
+            if not task.get("task_id") and task["status"] != "not_submitted":
+                continue
+            if task["status"] == "failed":
                 continue
             if resume and (not task.get("task_id") or task["status"] == "failed"):
                 continue
@@ -548,7 +568,10 @@ def execute(job, path, keys, resume=False, wait_timeout=1800, poll_interval=5):
                     write_json(path, job)
                     result = request_json(
                         API + "/videos", "007ai", keys["007ai"],
-                        payload=build_payload(job["prompt"], job["ratio"], job["images"], job.get("background")),
+                        payload=build_payload(
+                            task.get("prompt", job["prompt"]), job["ratio"], job["images"],
+                            task.get("background", job.get("background")),
+                        ),
                     )
                     task_id = result.get("id") or result.get("task_id")
                     if not isinstance(task_id, str) or not task_id:
@@ -575,6 +598,33 @@ def execute(job, path, keys, resume=False, wait_timeout=1800, poll_interval=5):
     return 0 if ok else 2
 
 
+def validate_plan(data):
+    def invalid():
+        raise SkillError("规划文件无效：需要 1–20 个包含提示词、非空配字和动作的项目。",
+                         "invalid_plan")
+
+    if not isinstance(data, dict) or not isinstance(data.get("items"), list):
+        invalid()
+    items = data["items"]
+    if not 1 <= len(items) <= 20:
+        invalid()
+    for item in items:
+        if not isinstance(item, dict):
+            invalid()
+        if (not isinstance(item.get("prompt"), str) or not item["prompt"].strip()
+                or not isinstance(item.get("caption"), str) or not item["caption"].strip()
+                or not isinstance(item.get("action"), str) or not item["action"].strip()):
+            invalid()
+        mode = item.get("background")
+        description = item.get("background_description")
+        if mode is not None and (
+                not isinstance(mode, str) or mode not in {"transparent", "custom", "preserve"}):
+            invalid()
+        if description is not None and not isinstance(description, str):
+            invalid()
+    return data
+
+
 def validate_job(job):
     def invalid():
         raise SkillError("任务记录损坏或字段不完整，无法恢复；请核对原始任务记录。", "invalid_job")
@@ -586,6 +636,15 @@ def validate_job(job):
     tasks = job.get("tasks")
     if not isinstance(tasks, list) or not 1 <= len(tasks) <= 20:
         invalid()
+    if "plan_status" in job:
+        if (not isinstance(job["plan_status"], str)
+                or job["plan_status"] not in {"awaiting_confirmation", "confirmed"}
+                or job.get("ratio") not in RATIOS
+                or not isinstance(job.get("prompt"), str) or not job["prompt"].strip()
+                or not isinstance(job.get("images"), list)):
+            invalid()
+        if "references" not in job and job["plan_status"] == "awaiting_confirmation":
+            invalid()
     statuses = {
         "not_submitted", "submission_unconfirmed", "submitted", "downloading",
         "saved", "failed", "rejected", "output_invalid", "waiting",
@@ -618,6 +677,14 @@ def validate_job(job):
             invalid()
         if status == "saved" and not task.get("file"):
             invalid()
+        if "prompt" in task and (not isinstance(task["prompt"], str) or not task["prompt"].strip()):
+            invalid()
+        if "caption" in task and (not isinstance(task["caption"], str) or not task["caption"].strip()):
+            invalid()
+        if "plan_status" in job and (
+                not isinstance(task.get("prompt"), str) or not task["prompt"].strip()
+                or not isinstance(task.get("caption"), str) or not task["caption"].strip()):
+            invalid()
     return job
 
 
@@ -629,6 +696,8 @@ def main():
     actions.add_argument("--configure", action="store_true")
     actions.add_argument("--check-remote", action="store_true")
     actions.add_argument("--resume", type=Path)
+    actions.add_argument("--plan-file", type=Path)
+    actions.add_argument("--confirm-plan", type=Path)
     parser.add_argument("--prompt-file", type=Path)
     parser.add_argument("--image", action="append", default=[])
     parser.add_argument("--ratio", choices=RATIOS, default="1:1")
@@ -674,8 +743,74 @@ def main():
             raise SkillError("--resume 不得和生成参数或 --dry-run 一起使用。")
         path = args.resume.expanduser().resolve()
         job = validate_job(read_json(path))
+        if job.get("plan_status") == "awaiting_confirmation":
+            raise SkillError("该规划尚未确认；确认后使用 --confirm-plan 启动生成。",
+                             "plan_confirmation_required")
         keys = require_keys(("007ai",))
         return execute(job, path, keys, True, args.wait_timeout, args.poll_interval)
+    if args.confirm_plan:
+        if (args.dry_run or args.prompt_file or args.image or args.background is not None
+                or args.background_description is not None or args.caption is not None):
+            raise SkillError("--confirm-plan 不得和新生成参数或 --dry-run 一起使用。")
+        path = args.confirm_plan.expanduser().resolve()
+        job = validate_job(read_json(path))
+        if job.get("plan_status") not in {"awaiting_confirmation", "confirmed"}:
+            raise SkillError("该规划不能确认；请检查规划状态或使用 --resume 恢复。", "invalid_plan_state")
+        keys = require_keys()
+        return execute(job, path, keys, False, args.wait_timeout, args.poll_interval)
+    if args.plan_file:
+        if (args.prompt_file or args.count != 1 or args.caption is not None
+                or args.background is not None or args.background_description is not None
+                or args.dry_run):
+            raise SkillError("--plan-file 使用规划文件中的逐项提示词；不能混用单条生成选项。")
+        data = validate_plan(read_json(args.plan_file.expanduser().resolve()))
+        if not args.output_dir:
+            raise SkillError("保存待确认规划时必须提供 --output-dir。")
+        prepared_items = []
+        for index, item in enumerate(data["items"], 1):
+            if item.get("background") == "preserve" and not args.image:
+                raise SkillError("保留参考图背景需要至少一张参考图。", "invalid_plan")
+            prepared = prepare_prompt(
+                item["prompt"].strip() + "\nGIF 动作：" + item["action"].strip(),
+                item.get("background"), item.get("background_description"), item["caption"],
+            )
+            prepared_items.append({
+                "index": index, **prepared,
+                "action": item["action"].strip(),
+                "scene": item.get("scene", ""),
+                "story_group": item.get("story_group"),
+                "story_role": item.get("story_role", ""),
+            })
+        output = args.output_dir.expanduser().resolve()
+        output.mkdir(parents=True, exist_ok=True)
+        path = output / ("plan-" + time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:12] + ".json")
+        job = {
+            "schema": 1, "model": MODEL, "output_format": "gif",
+            "plan_status": "awaiting_confirmation",
+            "sticker_type": str(data.get("type", "")).strip(),
+            "story_format": data.get("story_format", ""),
+            "prompt_template_version": PROMPT_TEMPLATE_VERSION,
+            "prompt": prepared_items[0]["prompt"],
+            "original_prompt": prepared_items[0]["original_prompt"],
+            "background_mode": "transparent", "background": "transparent",
+            "ratio": args.ratio, "references": [reference_info(value) for value in args.image],
+            "images": [], "created_at": time.time(),
+            "tasks": [{
+                **item, "status": "not_submitted",
+            } for item in prepared_items],
+        }
+        write_json(path, job)
+        emit({
+            "event": "plan_saved", "plan_status": job["plan_status"], "plan": str(path),
+            "type": job["sticker_type"], "story_format": job["story_format"],
+            "items": [{
+                "index": item["index"], "story_group": item["story_group"],
+                "story_role": item["story_role"], "caption": item["caption"],
+                "scene": item["scene"], "action": item["action"],
+                "prompt": item["original_prompt"],
+            } for item in prepared_items],
+        })
+        return 0
     keys = require_keys()
     if not args.prompt_file:
         raise SkillError("请提供 UTF-8 提示词文件 --prompt-file。")

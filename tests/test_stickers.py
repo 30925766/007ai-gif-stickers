@@ -277,7 +277,7 @@ class StickerTests(unittest.TestCase):
         self.path.write_text(json.dumps({"schema": 1, "model": stickers.MODEL}), encoding="utf-8")
         result = subprocess.run(
             [sys.executable, "-B", str(ROOT / "scripts/stickers.py"), "--resume", str(self.path)],
-            capture_output=True, encoding="utf-8", check=False,
+            capture_output=True, encoding="utf-8", errors="replace", check=False,
         )
         self.assertEqual(result.returncode, 1)
         self.assertEqual(json.loads(result.stdout)["code"], "invalid_job")
@@ -315,7 +315,7 @@ class StickerTests(unittest.TestCase):
         self.assertIn(stickers.GIF_REQUIREMENTS, payload["prompt"])
         self.assertNotIn("背景要求：", payload["prompt"])
         self.assertNotIn("透明", payload["prompt"])
-        self.assertEqual(prepared["prompt_template_version"], "3")
+        self.assertEqual(prepared["prompt_template_version"], stickers.PROMPT_TEMPLATE_VERSION)
         self.assertEqual(prepared["original_prompt"], "红色衣服，白色配字，挥手。")
 
     def test_custom_and_preserved_backgrounds_do_not_receive_transparency(self):
@@ -524,6 +524,192 @@ class StickerTests(unittest.TestCase):
                     sys, "argv", ["stickers.py", "--resume", str(self.path), *options]):
                 with self.assertRaises(stickers.SkillError):
                     stickers.main()
+
+    def write_plan_source(self, items=None):
+        plan_source = self.root / "creative-plan.json"
+        plan_source.write_text(json.dumps({
+            "type": "剧情反转", "story_format": "multi_gif",
+            "items": items or [
+                {"story_group": 1, "story_role": "铺垫", "caption": "今天开始减肥！",
+                 "scene": "宣布减肥", "action": "握拳并点头",
+                 "prompt": "角色坚定地握拳，宣布开始减肥。"},
+                {"story_group": 1, "story_role": "反转", "caption": "先吃完这顿",
+                 "scene": "被食物吸引", "action": "转头闻香并开心开吃",
+                 "prompt": "角色闻到香味，转头发现食物并立刻开心开吃。"},
+            ],
+        }, ensure_ascii=False), encoding="utf-8")
+        return plan_source
+
+    def create_pending_plan(self, items=None):
+        source = self.write_plan_source(items)
+        output = self.root / "plans"
+        with patch.object(sys, "argv", [
+                "stickers.py", "--plan-file", str(source), "--output-dir", str(output)]):
+            self.assertEqual(stickers.main(), 0)
+        return next(output.glob("plan-*.json"))
+
+    def test_plan_creation_is_offline_keyless_and_waits_for_confirmation(self):
+        source = self.write_plan_source()
+        image_path = self.root / "reference.png"
+        Image.new("RGB", (8, 8), "red").save(image_path)
+        with patch.object(sys, "argv", [
+                "stickers.py", "--plan-file", str(source), "--image", str(image_path),
+                "--output-dir", str(self.root / "plans")]), patch.object(
+                stickers, "require_keys", side_effect=AssertionError("Planning needs no keys")), patch.object(
+                stickers, "request_json") as request:
+            self.assertEqual(stickers.main(), 0)
+        request.assert_not_called()
+        path = next((self.root / "plans").glob("plan-*.json"))
+        plan = stickers.read_json(path)
+        self.assertEqual(plan["plan_status"], "awaiting_confirmation")
+        self.assertEqual(plan["sticker_type"], "剧情反转")
+        self.assertEqual(plan["story_format"], "multi_gif")
+        self.assertEqual([task["caption"] for task in plan["tasks"]], ["今天开始减肥！", "先吃完这顿"])
+        self.assertEqual([task["story_role"] for task in plan["tasks"]], ["铺垫", "反转"])
+        self.assertEqual(
+            plan["references"],
+            [{"path": str(image_path.resolve()), "upload": True}],
+        )
+        self.assertEqual(plan["images"], [])
+        self.assertTrue(all(task["status"] == "not_submitted" for task in plan["tasks"]))
+        self.assertTrue(all(task["prompt"].count(stickers.GIF_REQUIREMENTS) == 1
+                            for task in plan["tasks"]))
+        self.assertTrue(all(task["caption"] in task["prompt"] for task in plan["tasks"]))
+
+    def test_plan_schema_rejects_missing_caption_prompt_action_and_bad_counts(self):
+        good = {"prompt": "动作", "caption": "你好", "action": "挥手"}
+        for source in (
+            None, {}, {"items": []}, {"items": [good] * 21},
+            {"items": [None]},
+            {"items": [{**good, "caption": " "}]},
+            {"items": [{**good, "prompt": ""}]},
+            {"items": [{**good, "action": None}]},
+        ):
+            with self.subTest(source=source), self.assertRaises(stickers.SkillError) as error:
+                stickers.validate_plan(source)
+            self.assertEqual(error.exception.code, "invalid_plan")
+
+    def test_pending_plan_cannot_resume_but_confirmation_can_wait_for_credentials(self):
+        path = self.create_pending_plan()
+        for action in ("--resume", "--confirm-plan"):
+            with self.subTest(action=action), patch.object(sys, "argv", [
+                    "stickers.py", action, str(path)]), patch.object(
+                    stickers, "require_keys", side_effect=stickers.SkillError(
+                        "缺少 Key", "credentials_required")), patch.object(
+                    stickers, "request_json") as request:
+                if action == "--resume":
+                    with self.assertRaises(stickers.SkillError) as error:
+                        stickers.main()
+                    self.assertEqual(error.exception.code, "plan_confirmation_required")
+                else:
+                    with self.assertRaises(stickers.SkillError) as error:
+                        stickers.main()
+                    self.assertEqual(error.exception.code, "credentials_required")
+                request.assert_not_called()
+        self.assertEqual(stickers.read_json(path)["plan_status"], "awaiting_confirmation")
+
+    def test_confirmed_plan_submits_each_distinct_item_and_can_resume_without_resubmission(self):
+        path = self.create_pending_plan()
+        self.save_keys("fake-imgbb")
+        submitted = []
+        next_id = iter(("paid-task-1", "paid-task-2"))
+
+        def submit(url, provider, key, payload=None, form=None):
+            submitted.append(payload)
+            return {"id": next(next_id)}
+
+        def finish(job, task, job_path, *args):
+            destination = self.root / ("saved-" + str(task["index"]) + ".gif")
+            destination.write_bytes(self.gif)
+            task.update(status="saved", file=str(destination), error=None)
+            stickers.write_json(job_path, job)
+
+        with patch.object(sys, "argv", ["stickers.py", "--confirm-plan", str(path)]), patch.object(
+                stickers, "require_keys", return_value=self.keys), patch.object(
+                stickers, "request_json", side_effect=submit) as request, patch.object(
+                stickers, "finish_task", side_effect=finish), patch.object(
+                stickers, "reveal_file"):
+            self.assertEqual(stickers.main(), 0)
+        self.assertEqual(request.call_count, 2)
+        self.assertNotEqual(submitted[0]["prompt"], submitted[1]["prompt"])
+        self.assertIn("今天开始减肥！", submitted[0]["prompt"])
+        self.assertIn("先吃完这顿", submitted[1]["prompt"])
+        self.assertTrue(all(payload["output_format"] == "gif" for payload in submitted))
+        saved = stickers.read_json(path)
+        self.assertEqual(saved["plan_status"], "confirmed")
+        self.assertTrue(all(task["status"] == "saved" for task in saved["tasks"]))
+        with patch.object(sys, "argv", ["stickers.py", "--confirm-plan", str(path)]), patch.object(
+                stickers, "require_keys", return_value=self.keys), patch.object(
+                stickers, "request_json") as request, patch.object(
+                stickers, "reveal_file"):
+            self.assertEqual(stickers.main(), 0)
+        request.assert_not_called()
+
+    def test_confirmation_never_retries_uncertain_items_but_continues_unsubmitted_ones(self):
+        path = self.create_pending_plan()
+        job = stickers.read_json(path)
+        job["plan_status"] = "confirmed"
+        job["tasks"][0]["status"] = "submission_unconfirmed"
+        stickers.write_json(path, job)
+        self.save_keys("fake-imgbb")
+        with patch.object(sys, "argv", ["stickers.py", "--confirm-plan", str(path)]), patch.object(
+                stickers, "require_keys", return_value=self.keys), patch.object(
+                stickers, "request_json", return_value={"id": "paid-task-2"}) as request, patch.object(
+                stickers, "finish_task", side_effect=lambda job, task, *args: task.update(
+                    status="saved", file=str(self.root / "saved.gif"))), patch.object(
+                stickers.Path, "is_file", return_value=True), patch.object(
+                stickers, "reveal_file"):
+            self.assertEqual(stickers.main(), 2)
+        self.assertEqual(request.call_count, 1)
+        self.assertIn("先吃完这顿", request.call_args.kwargs["payload"]["prompt"])
+        saved = stickers.read_json(path)
+        self.assertEqual(saved["tasks"][0]["status"], "submission_unconfirmed")
+        self.assertEqual(saved["tasks"][1]["status"], "submitted")
+        self.assertEqual(saved["tasks"][1]["task_id"], "paid-task-2")
+
+    def test_plan_respects_per_item_background_and_includes_action(self):
+        path = self.create_pending_plan([
+            {"prompt": "角色开心", "caption": "嗨", "action": "挥手三次",
+             "background": "custom", "background_description": "粉色背景"},
+            {"prompt": "角色点头", "caption": "收到", "action": "点头两次"},
+        ])
+        planned = stickers.read_json(path)
+        self.assertIsNone(planned["tasks"][0]["background"])
+        self.assertIn("粉色背景", planned["tasks"][0]["prompt"])
+        self.assertIn("挥手三次", planned["tasks"][0]["prompt"])
+        self.assertEqual(planned["tasks"][1]["background"], "transparent")
+        submitted = []
+
+        def submit(url, provider, key, payload=None):
+            submitted.append(payload)
+            return {"id": "task-" + str(len(submitted))}
+
+        def finish(job, task, job_path, *args):
+            destination = self.root / (str(task["index"]) + ".gif")
+            destination.write_bytes(self.gif)
+            task.update(status="saved", file=str(destination))
+            stickers.write_json(job_path, job)
+
+        with patch.object(sys, "argv", ["stickers.py", "--confirm-plan", str(path)]), patch.object(
+                stickers, "require_keys", return_value=self.keys), patch.object(
+                stickers, "request_json", side_effect=submit), patch.object(
+                stickers, "finish_task", side_effect=finish):
+            self.assertEqual(stickers.main(), 0)
+        self.assertNotIn("background", submitted[0])
+        self.assertEqual(submitted[1]["background"], "transparent")
+
+    def test_confirm_plan_does_not_resubmit_rejected_items(self):
+        path = self.create_pending_plan()
+        job = stickers.read_json(path)
+        job["plan_status"] = "confirmed"
+        for task in job["tasks"]:
+            task["status"] = "rejected"
+        stickers.write_json(path, job)
+        with patch.object(sys, "argv", ["stickers.py", "--confirm-plan", str(path)]), patch.object(
+                stickers, "require_keys", return_value=self.keys), patch.object(
+                stickers, "request_json") as request:
+            self.assertEqual(stickers.main(), 2)
+        request.assert_not_called()
 
 
 if __name__ == "__main__":

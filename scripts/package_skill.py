@@ -8,7 +8,7 @@ FILES = (
     "SKILL.md", "VERSION", ".gitignore", "agents/openai.yaml",
     "scripts/run.ps1", "scripts/run.sh", "scripts/bootstrap.py",
     "scripts/stickers.py", "scripts/package_skill.py",
-    "references/api.md", "references/distribution.md",
+    "references/api.md", "references/distribution.md", "references/plans.md",
 )
 
 
