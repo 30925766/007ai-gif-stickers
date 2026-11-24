@@ -35,10 +35,23 @@ and must contain 1 to 20 objects. Each item requires nonempty `prompt`, `caption
 `action`; `scene`, `story_group`, and `story_role` are optional. User-provided captions
 must be preserved exactly.
 
+For a type containing "剧情反转", every item must specify `story_group` as a
+nonempty story name or positive integer. By default, 1–5 items share one group;
+6–10 items have two groups of at least three items each; 11–20 items use groups
+of three to five. When the user explicitly requests another grouping, set the
+top-level `story_count_override` to that number and `story_count_request` to their
+actual wording. Group count must match the override; never invent user approval.
+The script validates grouping before saving and before confirming a pending plan.
+Prepare local prompt drafts and run offline validation before displaying the table;
+do not show full drafts or submit requests before confirmation. Review causality
+separately: identical group labels alone do not make unrelated events one story.
+
 Each item may set `background` to `transparent` (the default), `custom`, or `preserve`.
 `custom` requires a nonempty `background_description`; `preserve` requires a reference.
-The script appends `action` to the creative prompt so the reviewed motion reaches the model.
-Show each full creative prompt to the user alongside the readable planning table.
+These are local planning options, not API fields. Transparent mode adds "透明背景"
+to the prompt; the API request omits `background` and retains `output_format=gif`.
+The script appends `action` to the creative prompt so the planned motion reaches the model.
+Before confirmation, show the concise planning table only; do not display full prompts.
 After edits or a selection of items, create a new pending plan containing only the final
 selected items, show it again, and obtain confirmation. Never edit submitted records.
 

@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import platform
 import re
+import socket
 import ssl
 import subprocess
 import sys
@@ -34,7 +35,7 @@ RATIOS = ("auto", "1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3",
 MAX_REFERENCE = 32 * 1024 * 1024
 MAX_DOWNLOAD = 64 * 1024 * 1024
 SECRETS = set()
-PROMPT_TEMPLATE_VERSION = "4"
+PROMPT_TEMPLATE_VERSION = "5"
 GIF_REQUIREMENTS = (
     "生成 GIF 动态表情包，输出文件格式必须为 GIF（.gif），且必须包含连续变化的多帧动画，"
     "不得输出 PNG、JPEG、单帧静态 GIF、拼图或精灵图。动作连续自然、无限循环，"
@@ -42,6 +43,11 @@ GIF_REQUIREMENTS = (
     "严格使用用户指定配字段落中的原文，不添加无关文字，配字不得被遮挡或裁切。"
     "本段及背景要求仅为制作指令，不得作为图中文字绘制。"
 )
+REPAIR_GUIDANCE = {
+    "invalid_gif": "修复重点：最终文件必须是真正的多帧动态 GIF；逐帧有可见变化，不要输出静态图片或其他格式。",
+    "caption_mismatch": "修复重点：每一处可见配字必须与指定原文完全一致；不要漏字、替换文字或增加文字。",
+    "visual_mismatch": "修复重点：严格遵循原始角色、服饰、场景和动作要求，不改变已确认的配字与故事。",
+}
 
 
 class SkillError(RuntimeError):
@@ -156,6 +162,50 @@ def tls_context():
     return context
 
 
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, request, fp, code, message, headers, new_url):
+        return None
+
+
+class ValidatedMediaRedirect(urllib.request.HTTPRedirectHandler):
+    def __init__(self, max_redirects=3):
+        super().__init__()
+        self.max_redirects = max_redirects
+        self.redirects = 0
+
+    def redirect_request(self, request, fp, code, message, headers, new_url):
+        self.redirects += 1
+        if self.redirects > self.max_redirects:
+            raise urllib.error.HTTPError(request.full_url, code,
+                                         "Too many media redirects", headers, fp)
+        try:
+            target = public_https(new_url)
+            validate_public_https_target(target)
+        except (SkillError, OSError, ValueError) as error:
+            raise urllib.error.HTTPError(request.full_url, code,
+                                         "Unsafe media redirect target", headers, fp) from error
+        redirected = super().redirect_request(request, fp, code, message, headers, target)
+        if redirected is not None:
+            for header, _ in redirected.header_items():
+                if header.lower() not in {"user-agent", "accept"}:
+                    redirected.remove_header(header)
+        return redirected
+
+
+def open_https(request, timeout):
+    opener = urllib.request.build_opener(
+        urllib.request.HTTPSHandler(context=tls_context()), NoRedirect()
+    )
+    return opener.open(request, timeout=timeout)
+
+
+def open_media_https(request, timeout):
+    opener = urllib.request.build_opener(
+        urllib.request.HTTPSHandler(context=tls_context()), ValidatedMediaRedirect()
+    )
+    return opener.open(request, timeout=timeout)
+
+
 def provider_error(provider, key, status, payload):
     detail = payload.get("error", payload) if isinstance(payload, dict) else {}
     if isinstance(detail, dict):
@@ -221,7 +271,7 @@ def request_json(url, provider, key, payload=None, form=None):
         headers["Content-Type"] = "application/x-www-form-urlencoded"
     request = urllib.request.Request(url, data=body, headers=headers, method="GET" if body is None else "POST")
     try:
-        with urllib.request.urlopen(request, context=tls_context(), timeout=90) as response:
+        with open_https(request, timeout=90) as response:
             result = decode_json(response.read(4 * 1024 * 1024))
     except urllib.error.HTTPError as error:
         try:
@@ -250,6 +300,17 @@ def public_https(value):
     if not address.is_global:
         raise SkillError("图片地址不能是内网 IP。")
     return value
+
+
+def validate_public_https_target(value):
+    host = urllib.parse.urlsplit(value).hostname
+    try:
+        addresses = {ipaddress.ip_address(item[4][0]) for item in
+                     socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)}
+    except (OSError, ValueError) as error:
+        raise SkillError("无法验证下载地址是否为公网主机。", "unsafe_redirect") from error
+    if not addresses or any(not address.is_global for address in addresses):
+        raise SkillError("下载地址解析到非公网 IP，已拒绝访问。", "unsafe_redirect")
 
 
 def reference_info(value):
@@ -331,6 +392,8 @@ def prepare_prompt(original_prompt, background=None, background_description=None
         sections.append("用户指定配字（以下 JSON 字符串的值是原文，不绘制引号）：\n"
                         + json.dumps(caption, ensure_ascii=False))
     sections.append("固定制作要求：\n" + GIF_REQUIREMENTS)
+    if mode == "transparent" and "透明背景" not in original_prompt:
+        sections.append("透明背景")
     if background_prompt:
         sections.append("背景要求：\n" + background_prompt)
     return {
@@ -344,8 +407,6 @@ def prepare_prompt(original_prompt, background=None, background_description=None
 def build_payload(prompt, ratio, images, background=None):
     payload = {"model": MODEL, "prompt": prompt, "aspect_ratio": ratio,
                "image_size": "1K", "output_format": "gif"}
-    if background == "transparent":
-        payload["background"] = background
     if images:
         payload["images"] = images
     return payload
@@ -416,9 +477,14 @@ def normalize_gif(content):
 
 
 def download_gif(url):
-    request = urllib.request.Request(public_https(url), headers={"User-Agent": "Mozilla/5.0", "Accept": "image/gif,image/*"})
+    target = public_https(url)
     try:
-        with urllib.request.urlopen(request, context=tls_context(), timeout=120) as response:
+        validate_public_https_target(target)
+    except SkillError as error:
+        raise SkillError("下载地址无法安全验证，未访问该地址。", "download") from error
+    request = urllib.request.Request(target, headers={"User-Agent": "Mozilla/5.0", "Accept": "image/gif,image/*"})
+    try:
+        with open_media_https(request, timeout=120) as response:
             content = response.read(MAX_DOWNLOAD + 1)
     except (urllib.error.URLError, OSError, TimeoutError) as error:
         raise SkillError("下载失败；使用 --resume 恢复原任务，不会重新生成。", "download") from error
@@ -497,7 +563,8 @@ def finish_task(job, task, path, key, wait_timeout, poll_interval):
             if attempt:
                 raise
             emit({"event": "refreshing_result", "task_id": task["task_id"]})
-    destination = path.parent / (path.stem + "-" + str(task["index"]) + ".gif")
+    suffix = "-r" + str(task["regeneration_count"]) if task.get("regeneration_count") else ""
+    destination = path.parent / (path.stem + "-" + str(task["index"]) + suffix + ".gif")
     fd, temp_name = tempfile.mkstemp(prefix=".gif-download-", dir=path.parent)
     try:
         with os.fdopen(fd, "wb") as handle:
@@ -506,31 +573,115 @@ def finish_task(job, task, path, key, wait_timeout, poll_interval):
     finally:
         if os.path.exists(temp_name):
             os.unlink(temp_name)
-    task.update({"status": "saved", "file": str(destination), "gif": metadata, "error": None})
+    task.update({"status": "saved", "file": str(destination), "gif": metadata,
+                 "error": None, "review_status": "pending"})
+    task.pop("review_evidence", None)
     write_json(path, job)
     emit({"event": "saved", "file": str(destination), "gif": metadata})
 
 
+def repair_policy(job):
+    return job.get("regeneration", {"mode": "confirm", "per_item": 1, "total": 2})
+
+
+def delivery_ready(job):
+    return all(task["status"] == "saved" and task.get("review_status") == "passed"
+               and Path(task.get("file", "")).is_file() for task in job["tasks"])
+
+
+def repair_allowed(job, task):
+    policy = repair_policy(job)
+    return (task.get("regeneration_count", 0) < policy["per_item"]
+            and sum(item.get("regeneration_count", 0) for item in job["tasks"]) < policy["total"])
+
+
+def propose_repair(job, task, path, defect, evidence):
+    if defect not in REPAIR_GUIDANCE or not isinstance(evidence, str) or not evidence.strip():
+        raise SkillError("缺陷类型或证据无效。", "invalid_review")
+    if not repair_allowed(job, task):
+        task["status"] = "repair_limit"
+        write_json(path, job)
+        emit({"event": "repair_limit", "index": task["index"], "defect": defect})
+        return
+    base = task.get("base_prompt") or task.get("prompt") or job.get("prompt")
+    if not isinstance(base, str) or not base.strip():
+        raise SkillError("缺少原始提交提示词，无法安全重生。", "invalid_job")
+    task["base_prompt"] = base
+    caption = task.get("caption", job.get("caption"))
+    if defect == "caption_mismatch" and (not isinstance(caption, str) or not caption.strip()):
+        raise SkillError("缺少原始配字，无法自动修正。", "invalid_review")
+    guidance = REPAIR_GUIDANCE[defect]
+    if defect == "caption_mismatch":
+        guidance += " 正确配字：" + json.dumps(caption, ensure_ascii=False)
+    task["repair"] = {"defect": defect, "evidence": evidence.strip(),
+                      "prompt": base + "\n\n" + guidance}
+    task["status"] = "repair_pending"
+    write_json(path, job)
+    emit({"event": "repair_proposed", "index": task["index"], "defect": defect,
+          "evidence": evidence.strip(), "prompt": task["repair"]["prompt"],
+          "mode": repair_policy(job)["mode"]})
+
+
+def reserve_regeneration(job, task, path):
+    if task["status"] != "repair_pending" or not repair_allowed(job, task):
+        raise SkillError("该项没有可用的已审核重生额度。", "repair_limit")
+    if (job.get("ratio") not in RATIOS or not isinstance(job.get("images"), list)
+            or not isinstance(task.get("repair", {}).get("prompt"), str)
+            or not task.get("task_id")):
+        raise SkillError("任务缺少原始请求参数，无法安全重生。", "invalid_job")
+    previous = {key: task[key] for key in ("task_id", "file", "prompt", "gif", "error")
+                if key in task}
+    previous.update({"defect": task["repair"]["defect"],
+                     "evidence": task["repair"]["evidence"]})
+    task.setdefault("history", []).append(previous)
+    task["regeneration_count"] = task.get("regeneration_count", 0) + 1
+    task["prompt"] = task["repair"]["prompt"]
+    for key in ("task_id", "result_url", "file", "gif", "error", "repair",
+                "review_status", "review_evidence"):
+        task.pop(key, None)
+    task["status"] = "submission_unconfirmed"
+    write_json(path, job)
+
+
 def reveal_file(file):
     destination = Path(file).resolve()
+    system = platform.system()
     try:
         if not destination.is_file():
             raise OSError("Saved GIF does not exist.")
-        system = platform.system()
         if system == "Windows":
             command = ["explorer.exe", "/select,", str(destination)]
         elif system == "Darwin":
             command = ["open", "-R", str(destination)]
         else:
             raise OSError("Automatic file reveal requires Windows or macOS.")
-        subprocess.run(command, check=True, timeout=10)
-        emit({"event": "file_location_opened", "file": str(destination)})
+        subprocess.run(command, check=True, timeout=10,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    except (OSError, subprocess.SubprocessError) as error:
+        first_error = error
+    try:
+        if not destination.is_file():
+            raise OSError("Saved GIF does not exist.")
+        if system == "Windows":
+            subprocess.run(["explorer.exe", str(destination.parent)], check=True, timeout=10,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        elif system == "Darwin":
+            subprocess.run(["open", str(destination.parent)], check=True, timeout=10,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        else:
+            raise OSError("Automatic file reveal requires Windows or macOS.")
+        return True
     except (OSError, subprocess.SubprocessError) as error:
         emit({"event": "file_location_warning", "file": str(destination),
-              "message": "无法自动打开文件位置，请通过文件链接打开。", "detail": safe_message(error)})
+              "message": "GIF 已保存，但无法自动打开其所在文件夹。",
+              "detail": safe_message(error), "select_error": safe_message(first_error)})
+        return False
 
 
-def execute(job, path, keys, resume=False, wait_timeout=1800, poll_interval=5):
+def execute(job, path, keys, resume=False, wait_timeout=1800, poll_interval=5,
+            only_index=None, submit_reserved=False, regeneration_config=None,
+            continue_unsubmitted=False):
     with job_lock(path):
         if "plan_status" in job:
             # Reload under the lock so concurrent confirmations cannot erase task IDs.
@@ -538,10 +689,31 @@ def execute(job, path, keys, resume=False, wait_timeout=1800, poll_interval=5):
             if resume and job["plan_status"] == "awaiting_confirmation":
                 raise SkillError("该规划尚未确认。", "plan_confirmation_required")
             if not resume and job["plan_status"] == "awaiting_confirmation":
+                validate_story_groups({
+                    "type": job.get("sticker_type"),
+                    "story_count_override": job.get("story_count_override"),
+                    "story_count_request": job.get("story_count_request"),
+                }, job["tasks"])
+                if regeneration_config is not None:
+                    job["regeneration"] = regeneration_config
                 job["plan_status"] = "confirmed"
                 job["confirmed_at"] = time.time()
                 write_json(path, job)
-        if not resume:
+            elif not resume and job["plan_status"] == "confirmed":
+                # Another invocation may have confirmed while this one loaded keys.
+                # Treat that race as resume so no unsent item can be submitted.
+                resume = True
+            elif regeneration_config and regeneration_config["mode"] == "auto":
+                raise SkillError("已确认的规划不能追认自动重生授权。", "invalid_plan_state")
+        elif continue_unsubmitted:
+            job = validate_job(read_json(path))
+            if any(task["status"] == "submission_unconfirmed" and not task.get("task_id")
+                   for task in job["tasks"]):
+                raise SkillError("存在提交结果不明的项目；请先核对服务端任务和账单。",
+                                 "submission_unconfirmed")
+            if not any(task["status"] == "not_submitted" for task in job["tasks"]):
+                raise SkillError("没有可续跑的未提交项目。", "nothing_to_continue")
+        if not resume and only_index is None:
             # Resolve all references before any chargeable task is submitted.
             references = job.pop("references", None)
             if references is not None:
@@ -552,50 +724,100 @@ def execute(job, path, keys, resume=False, wait_timeout=1800, poll_interval=5):
             elif not isinstance(job.get("images"), list):
                 raise SkillError("规划缺少参考图状态，无法安全启动或恢复。", "invalid_job")
         for task in job["tasks"]:
+            if only_index is not None and task["index"] != only_index:
+                continue
+            if continue_unsubmitted and task["status"] != "not_submitted":
+                continue
             if task["status"] == "saved" and Path(task.get("file", "")).is_file():
                 continue
-            if task["status"] == "submission_unconfirmed" and not task.get("task_id"):
+            if (task["status"] == "submission_unconfirmed" and not task.get("task_id")
+                    and not (submit_reserved and task["index"] == only_index)):
                 continue
-            if not task.get("task_id") and task["status"] != "not_submitted":
+            if (not task.get("task_id") and task["status"] != "not_submitted"
+                    and not (submit_reserved and task["index"] == only_index)):
                 continue
-            if task["status"] == "failed":
+            if task["status"] in {"failed", "repair_pending", "repair_limit"}:
                 continue
             if resume and (not task.get("task_id") or task["status"] == "failed"):
                 continue
-            try:
-                if not task.get("task_id"):
-                    task["status"] = "submission_unconfirmed"
+            while True:
+                try:
+                    if not task.get("task_id"):
+                        task["status"] = "submission_unconfirmed"
+                        write_json(path, job)
+                        result = request_json(
+                            API + "/videos", "007ai", keys["007ai"],
+                            payload=build_payload(
+                                task.get("prompt", job["prompt"]), job["ratio"], job["images"],
+                                task.get("background", job.get("background")),
+                            ),
+                        )
+                        task_id = result.get("id") or result.get("task_id")
+                        if not isinstance(task_id, str) or not task_id:
+                            raise SkillError("未取得任务 ID；提交结果不确定，请核对服务端，勿自动重提。", "submission_unconfirmed")
+                        task.update({"task_id": task_id, "status": "submitted"})
+                        write_json(path, job)
+                        emit({"event": "submitted", "task_id": task_id, "job": str(path)})
+                    finish_task(job, task, path, keys["007ai"], wait_timeout, poll_interval)
+                    reveal_file(task["file"])
+                    break
+                except SkillError as error:
+                    task["error"] = {"code": error.code, "message": safe_message(error)}
+                    if not task.get("task_id"):
+                        task["status"] = "rejected" if error.code in {
+                            "invalid_key", "permission", "billing", "request_rejected", "rate_limit"
+                        } else "submission_unconfirmed"
+                    elif task["status"] != "failed":
+                        task["status"] = "output_invalid" if error.code == "invalid_gif" else "waiting"
                     write_json(path, job)
-                    result = request_json(
-                        API + "/videos", "007ai", keys["007ai"],
-                        payload=build_payload(
-                            task.get("prompt", job["prompt"]), job["ratio"], job["images"],
-                            task.get("background", job.get("background")),
-                        ),
-                    )
-                    task_id = result.get("id") or result.get("task_id")
-                    if not isinstance(task_id, str) or not task_id:
-                        raise SkillError("未取得任务 ID；提交结果不确定，请核对服务端，勿自动重提。", "submission_unconfirmed")
-                    task.update({"task_id": task_id, "status": "submitted"})
-                    write_json(path, job)
-                    emit({"event": "submitted", "task_id": task_id, "job": str(path)})
-                finish_task(job, task, path, keys["007ai"], wait_timeout, poll_interval)
-                reveal_file(task["file"])
-            except SkillError as error:
-                task["error"] = {"code": error.code, "message": safe_message(error)}
-                if not task.get("task_id"):
-                    task["status"] = "rejected" if error.code in {
-                        "invalid_key", "permission", "billing", "request_rejected", "rate_limit"
-                    } else "submission_unconfirmed"
-                elif task["status"] != "failed":
-                    task["status"] = "output_invalid" if error.code == "invalid_gif" else "waiting"
-                write_json(path, job)
-                emit({"event": "task_error", "index": task["index"], **task["error"]})
-                # Do not spend more money after any failed/unconfirmed item.
+                    emit({"event": "task_error", "index": task["index"], **task["error"]})
+                    if error.code == "invalid_gif" and task.get("task_id"):
+                        propose_repair(job, task, path, "invalid_gif", str(error))
+                        if (task["status"] == "repair_pending"
+                                and repair_policy(job)["mode"] == "auto"):
+                            reserve_regeneration(job, task, path)
+                            continue
+                    # Stop on an uncertain submission or unavailable original task.
+                    break
+            if task["status"] != "saved":
                 break
     ok = all(task["status"] == "saved" and Path(task.get("file", "")).is_file() for task in job["tasks"])
-    emit({"ok": ok, "job": str(path), "tasks": job["tasks"]})
+    emit({"ok": ok, "delivery_ready": delivery_ready(job),
+          "job": str(path), "tasks": job["tasks"]})
     return 0 if ok else 2
+
+
+def validate_story_groups(data, items):
+    if "剧情反转" not in str(data.get("type", "")):
+        return
+    counts = {}
+    for item in items:
+        group = item.get("story_group")
+        if not ((type(group) is int and group > 0)
+                or (isinstance(group, str) and group.strip())):
+            raise SkillError("剧情反转每项必须包含有效的故事分组。", "invalid_story_groups")
+        group = str(group).strip()
+        counts[group] = counts.get(group, 0) + 1
+    override = data.get("story_count_override")
+    if override is not None:
+        request = data.get("story_count_request")
+        if (type(override) is not int or not 1 <= override <= len(items)
+                or not isinstance(request, str) or not request.strip()
+                or len(counts) != override):
+            raise SkillError("自定义故事数量须匹配分组，并记录用户明确指定的原话。",
+                             "invalid_story_groups")
+        return
+    size = len(items)
+    if size <= 5:
+        valid = len(counts) == 1
+    elif size <= 10:
+        valid = len(counts) == 2 and min(counts.values()) >= 3
+    else:
+        valid = all(3 <= count <= 5 for count in counts.values())
+    if not valid:
+        raise SkillError("剧情分组不符合默认规则：1–5 张一个故事，6–10 张两个故事"
+                         "且每组至少 3 张，11–20 张每组 3–5 张；请先重写规划。",
+                         "invalid_story_groups")
 
 
 def validate_plan(data):
@@ -622,6 +844,7 @@ def validate_plan(data):
             invalid()
         if description is not None and not isinstance(description, str):
             invalid()
+    validate_story_groups(data, items)
     return data
 
 
@@ -636,6 +859,12 @@ def validate_job(job):
     tasks = job.get("tasks")
     if not isinstance(tasks, list) or not 1 <= len(tasks) <= 20:
         invalid()
+    policy = job.get("regeneration")
+    if policy is not None and (not isinstance(policy, dict)
+            or policy.get("mode") not in {"confirm", "auto"}
+            or type(policy.get("per_item")) is not int or not 1 <= policy["per_item"] <= 3
+            or type(policy.get("total")) is not int or not 1 <= policy["total"] <= 20):
+        invalid()
     if "plan_status" in job:
         if (not isinstance(job["plan_status"], str)
                 or job["plan_status"] not in {"awaiting_confirmation", "confirmed"}
@@ -648,8 +877,10 @@ def validate_job(job):
     statuses = {
         "not_submitted", "submission_unconfirmed", "submitted", "downloading",
         "saved", "failed", "rejected", "output_invalid", "waiting",
+        "repair_pending", "repair_limit",
     }
-    needs_id = {"submitted", "downloading", "saved", "failed", "output_invalid", "waiting"}
+    needs_id = {"submitted", "downloading", "saved", "failed", "output_invalid",
+                "waiting", "repair_pending", "repair_limit"}
     indices = set()
     for task in tasks:
         if not isinstance(task, dict):
@@ -685,6 +916,35 @@ def validate_job(job):
                 not isinstance(task.get("prompt"), str) or not task["prompt"].strip()
                 or not isinstance(task.get("caption"), str) or not task["caption"].strip()):
             invalid()
+        count = task.get("regeneration_count", 0)
+        if type(count) is not int or not 0 <= count <= 3:
+            invalid()
+        if "history" in task and (not isinstance(task["history"], list)
+                or len(task["history"]) != count
+                or any(not isinstance(entry, dict)
+                       or not isinstance(entry.get("task_id"), str)
+                       or not entry["task_id"].strip() for entry in task["history"])):
+            invalid()
+        if count and ("history" not in task or not isinstance(task.get("prompt"), str)):
+            invalid()
+        if status == "repair_pending":
+            repair = task.get("repair")
+            if (not isinstance(repair, dict)
+                    or repair.get("defect") not in REPAIR_GUIDANCE
+                    or not isinstance(repair.get("evidence"), str)
+                    or not repair["evidence"].strip()
+                    or not isinstance(repair.get("prompt"), str)
+                    or not repair["prompt"].strip()):
+                invalid()
+    if policy and sum(task.get("regeneration_count", 0) for task in tasks) > policy["total"]:
+        invalid()
+    for task in tasks:
+        if task.get("review_status") not in (None, "pending", "passed", "failed"):
+            invalid()
+        if "review_evidence" in task and (
+                not isinstance(task["review_evidence"], str)
+                or not task["review_evidence"].strip()):
+            invalid()
     return job
 
 
@@ -696,8 +956,12 @@ def main():
     actions.add_argument("--configure", action="store_true")
     actions.add_argument("--check-remote", action="store_true")
     actions.add_argument("--resume", type=Path)
+    actions.add_argument("--continue-unsubmitted", type=Path)
     actions.add_argument("--plan-file", type=Path)
     actions.add_argument("--confirm-plan", type=Path)
+    actions.add_argument("--report-defect", type=Path)
+    actions.add_argument("--approve-regeneration", type=Path)
+    actions.add_argument("--accept-review", type=Path)
     parser.add_argument("--prompt-file", type=Path)
     parser.add_argument("--image", action="append", default=[])
     parser.add_argument("--ratio", choices=RATIOS, default="1:1")
@@ -705,6 +969,12 @@ def main():
     parser.add_argument("--background-description")
     parser.add_argument("--caption")
     parser.add_argument("--count", type=int, default=1)
+    parser.add_argument("--index", type=int)
+    parser.add_argument("--defect", choices=["caption_mismatch", "visual_mismatch"])
+    parser.add_argument("--evidence")
+    parser.add_argument("--auto-regenerate", action="store_true")
+    parser.add_argument("--max-regenerations-per-item", type=int, default=1)
+    parser.add_argument("--max-regenerations-total", type=int, default=2)
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--wait-timeout", type=float, default=1800)
@@ -733,6 +1003,62 @@ def main():
         raise SkillError("数量需为 1–20，参考图最多 8 张。")
     if not 0 < args.wait_timeout <= 7200 or not 1 <= args.poll_interval <= 30:
         raise SkillError("等待时间需在 0–7200 秒内，轮询间隔为 1–30 秒。")
+    if (not 1 <= args.max_regenerations_per_item <= 3
+            or not 1 <= args.max_regenerations_total <= 20):
+        raise SkillError("重生上限须为每项 1–3 次、整批 1–20 次。")
+    defaults = args.max_regenerations_per_item == 1 and args.max_regenerations_total == 2
+    if not args.auto_regenerate and not defaults:
+        raise SkillError("设置重生上限时必须明确启用 --auto-regenerate。")
+    if (args.resume or args.continue_unsubmitted or args.report_defect
+            or args.approve_regeneration or args.accept_review or args.plan_file) and (
+            args.auto_regenerate or not defaults):
+        raise SkillError("该命令不能重新设置重生授权。")
+    if args.index is not None and not (args.report_defect or args.approve_regeneration
+                                        or args.accept_review):
+        raise SkillError("--index 仅用于视觉验收或重生操作。")
+    if args.report_defect or args.approve_regeneration or args.accept_review:
+        if (args.prompt_file or args.image or args.dry_run or args.background
+                or args.background_description or args.caption or args.count != 1
+                or args.output_dir or args.ratio != "1:1"
+                or args.index is None or args.index < 1):
+            raise SkillError("缺陷操作只能指定任务记录、--index 和对应缺陷参数。")
+        if args.report_defect and (not args.defect or not args.evidence or not args.evidence.strip()):
+            raise SkillError("请提供缺陷类型和具体视觉证据。", "invalid_review")
+        if args.approve_regeneration and (args.defect or args.evidence):
+            raise SkillError("批准操作不能修改已保存的缺陷或提示词。", "invalid_review")
+        if args.accept_review and (
+                args.defect or not args.evidence or not args.evidence.strip()):
+            raise SkillError("视觉验收通过需要具体的检查依据。", "invalid_review")
+        path = (args.report_defect or args.approve_regeneration or args.accept_review).expanduser().resolve()
+        with job_lock(path):
+            job = validate_job(read_json(path))
+            if job.get("plan_status") == "awaiting_confirmation":
+                raise SkillError("规划尚未确认。", "plan_confirmation_required")
+            task = next((item for item in job["tasks"] if item["index"] == args.index), None)
+            if task is None:
+                raise SkillError("找不到对应序号。", "invalid_review")
+            if args.accept_review:
+                if task["status"] != "saved" or not Path(task["file"]).is_file():
+                    raise SkillError("只能验收已保存的 GIF。", "invalid_review")
+                task.update(review_status="passed", review_evidence=args.evidence.strip())
+                write_json(path, job)
+                emit({"event": "review_passed", "index": task["index"],
+                      "file": task["file"], "delivery_ready": delivery_ready(job)})
+                return 0
+            if args.report_defect:
+                if task["status"] != "saved" or not Path(task["file"]).is_file():
+                    raise SkillError("仅可对已保存的 GIF 报告视觉缺陷。", "invalid_review")
+                task["review_status"] = "failed"
+                propose_repair(job, task, path, args.defect, args.evidence)
+                if task["status"] != "repair_pending" or repair_policy(job)["mode"] != "auto":
+                    return 0
+            elif task["status"] != "repair_pending":
+                raise SkillError("该项没有待确认的重生提案。", "invalid_review")
+            keys = require_keys(("007ai",))
+            reserve_regeneration(job, task, path)
+        return execute(job, path, keys, wait_timeout=args.wait_timeout,
+                       poll_interval=args.poll_interval, only_index=args.index,
+                       submit_reserved=True)
     if args.check_remote:
         keys = require_keys(("007ai",))
         emit(remote_check(keys["007ai"]))
@@ -748,16 +1074,39 @@ def main():
                              "plan_confirmation_required")
         keys = require_keys(("007ai",))
         return execute(job, path, keys, True, args.wait_timeout, args.poll_interval)
+    if args.continue_unsubmitted:
+        if (args.dry_run or args.prompt_file or args.image or args.background is not None
+                or args.background_description is not None or args.caption is not None
+                or args.output_dir or args.count != 1 or args.ratio != "1:1"):
+            raise SkillError("--continue-unsubmitted 不得混用生成参数。")
+        path = args.continue_unsubmitted.expanduser().resolve()
+        job = validate_job(read_json(path))
+        if "plan_status" in job:
+            raise SkillError("规划任务请使用 --confirm-plan 继续。", "invalid_plan_state")
+        keys = require_keys()
+        return execute(job, path, keys, wait_timeout=args.wait_timeout,
+                       poll_interval=args.poll_interval, continue_unsubmitted=True)
     if args.confirm_plan:
         if (args.dry_run or args.prompt_file or args.image or args.background is not None
                 or args.background_description is not None or args.caption is not None):
             raise SkillError("--confirm-plan 不得和新生成参数或 --dry-run 一起使用。")
         path = args.confirm_plan.expanduser().resolve()
         job = validate_job(read_json(path))
-        if job.get("plan_status") not in {"awaiting_confirmation", "confirmed"}:
-            raise SkillError("该规划不能确认；请检查规划状态或使用 --resume 恢复。", "invalid_plan_state")
+        if job.get("plan_status") != "awaiting_confirmation":
+            raise SkillError("该规划已确认或状态无效；请使用 --resume 恢复已有任务。",
+                             "invalid_plan_state")
+        validate_story_groups({
+            "type": job.get("sticker_type"),
+            "story_count_override": job.get("story_count_override"),
+            "story_count_request": job.get("story_count_request"),
+        }, job["tasks"])
         keys = require_keys()
-        return execute(job, path, keys, False, args.wait_timeout, args.poll_interval)
+        return execute(job, path, keys, False, args.wait_timeout, args.poll_interval,
+                       regeneration_config={
+                           "mode": "auto" if args.auto_regenerate else "confirm",
+                           "per_item": args.max_regenerations_per_item,
+                           "total": args.max_regenerations_total,
+                       })
     if args.plan_file:
         if (args.prompt_file or args.count != 1 or args.caption is not None
                 or args.background is not None or args.background_description is not None
@@ -789,6 +1138,8 @@ def main():
             "plan_status": "awaiting_confirmation",
             "sticker_type": str(data.get("type", "")).strip(),
             "story_format": data.get("story_format", ""),
+            "story_count_override": data.get("story_count_override"),
+            "story_count_request": data.get("story_count_request"),
             "prompt_template_version": PROMPT_TEMPLATE_VERSION,
             "prompt": prepared_items[0]["prompt"],
             "original_prompt": prepared_items[0]["original_prompt"],
@@ -834,6 +1185,11 @@ def main():
     path = output / ("job-" + time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:12] + ".json")
     job = {"schema": 1, "model": MODEL, "output_format": "gif", **prepared,
            "ratio": args.ratio, "references": infos, "created_at": time.time(),
+           "regeneration": {
+               "mode": "auto" if args.auto_regenerate else "confirm",
+               "per_item": args.max_regenerations_per_item,
+               "total": args.max_regenerations_total,
+           },
            "tasks": [{"index": i + 1, "status": "not_submitted"} for i in range(args.count)]}
     write_json(path, job)
     emit({"event": "job_created", "job": str(path)})
